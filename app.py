@@ -103,44 +103,112 @@ def normalize(name):
 
 
 def parse_bonds(content):
+    """Read only canonical 10-year yield rows, not daily/weekly changes."""
     soup = BeautifulSoup(content, 'html.parser')
     result = {}
     for tr in soup.select('tr'):
         link = tr.select_one('a[href*="/government-bond-yield"]')
         if not link:
             continue
-        cells = tr.find_all('td', recursive=False)
-        if len(cells) < 2:
+        # Other maturities can have similar URLs. Accept the canonical 10Y path only.
+        href = link.get('href', '').split('?')[0].rstrip('/')
+        if not href.endswith('/government-bond-yield'):
             continue
+        cells = tr.find_all('td', recursive=False)
         name = normalize(link.get_text(' ', strip=True))
+        if not name or not cells:
+            continue
         value_node = tr.select_one('[id="p"], [data-field="Last"]')
-        value_text = (value_node or cells[1]).get_text(' ', strip=True).replace('%', '').replace(',', '')
+        if value_node is None:
+            country_i = next((i for i, c in enumerate(cells) if link in c.descendants), None)
+            if country_i is None or country_i + 1 >= len(cells):
+                continue
+            value_node = cells[country_i + 1]
+        value_text = value_node.get_text(' ', strip=True).replace('%', '').replace(',', '').replace('−', '-')
         try:
             value = float(value_text) / 100
         except ValueError:
             continue
-        if not -0.99 < value < 2:
+        if not math.isfinite(value) or not -0.99 < value < 2:
             continue
         date_node = tr.select_one('[id="date"], time, [data-field="Date"]')
-        date = date_node.get('datetime') or date_node.get_text(' ', strip=True) if date_node else 'Source timestamp not exposed'
+        if date_node is not None:
+            date = date_node.get('datetime') or date_node.get_text(' ', strip=True)
+        else:
+            # The public page places Date last. Only use text that looks like a timestamp.
+            last = cells[-1].get_text(' ', strip=True)
+            date = last if re.fullmatch(r'(?:[A-Za-z]{3}/\d{1,2}|\d{1,2}:\d{2}|\d{4}-\d{2}-\d{2}(?:[T ].*)?)', last) else 'Source timestamp not exposed'
         result[name] = {'value': value, 'date': date}
-    if not result:
-        raise ValueError('Trading Economics returned no readable yield rows (dynamic page or access restriction).')
-    return result, 'Observation timestamps as displayed by Trading Economics'
+    if 'United States' not in result:
+        raise ValueError('No usable U.S. 10-year yield row was found; refusing to label an incomplete or blocked page as a successful fetch.')
+    return result, 'Observation timestamps exactly as displayed by Trading Economics; retrieval time is recorded separately'
+
+
+def fetch_bonds_browser():
+    """Render the public page normally. Stop at access denial or a human challenge."""
+    import shutil
+    from playwright.sync_api import sync_playwright, TimeoutError as BrowserTimeout
+
+    executable = shutil.which('chromium') or shutil.which('chromium-browser')
+    if not executable:
+        raise RuntimeError('Chromium is not installed. Add packages.txt to the repository root and reboot the app.')
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(executable_path=executable, headless=True, timeout=20000)
+        try:
+            page = browser.new_page()
+            response = page.goto(BONDS_URL, wait_until='domcontentloaded', timeout=30000)
+            if response is not None and response.status >= 400:
+                raise RuntimeError(f'Trading Economics rejected the browser request (HTTP {response.status}).')
+            try:
+                state = page.wait_for_function('''() => {
+                    const rows = [...document.querySelectorAll('table tr')];
+                    const hasUS = rows.some(row => {
+                        const a = row.querySelector('a[href*="/united-states/government-bond-yield"]');
+                        return a && row.querySelectorAll('td').length >= 2;
+                    });
+                    if (hasUS) return 'table';
+                    const text = (document.body.innerText || '').toLowerCase();
+                    if (text.includes('confirm you are human') || text.includes('verify you are human') ||
+                        text.includes('access denied') || text.includes('unusual traffic')) return 'blocked';
+                    return false;
+                }''', timeout=25000).json_value()
+            except BrowserTimeout:
+                raise RuntimeError('The browser loaded the page, but the bond table did not appear within 25 seconds.') from None
+            if state == 'blocked':
+                raise RuntimeError('Trading Economics requires human verification or denies access from this server. The app does not bypass that restriction.')
+            return parse_bonds(page.content())
+        finally:
+            browser.close()
+
+
+def fetch_bonds():
+    """Try static public HTML once, then normal JavaScript rendering once."""
+    try:
+        data, date = parse_bonds(fetch(BONDS_URL))
+        return data, date, 'Public HTML'
+    except (requests.RequestException, ValueError) as direct_error:
+        try:
+            data, date = fetch_bonds_browser()
+            return data, date, 'Chromium-rendered public page'
+        except Exception as browser_error:
+            message = str(browser_error).split('Call log:')[0].strip()
+            if len(message) > 700:
+                message = message[:700] + '…'
+            raise RuntimeError(f'Public HTML unavailable; browser attempt: {message}') from browser_error
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_source(kind):
     urls = {'betas': BETA_URL, 'spread': SPREAD_URL, 'taxes': TAX_URL, 'bonds': BONDS_URL}
-    parsers = {'betas': parse_betas, 'spread': parse_spread, 'taxes': parse_taxes, 'bonds': parse_bonds}
+    parsers = {'betas': parse_betas, 'spread': parse_spread, 'taxes': parse_taxes}
     url = urls[kind]
     try:
-        content = fetch(url)
-        if kind == 'bonds' and b'partial' in content and b'te-markets-body' in content:
-            # Public table fragment requested by the source page itself; no API key.
-            content = fetch(BONDS_URL + '?partial=markets')
-        data, date = parsers[kind](content)
-        return dict(data=data, date=date, retrieved=now(), url=url, status='Fetched', error='')
+        if kind == 'bonds':
+            data, date, method = fetch_bonds()
+        else:
+            data, date = parsers[kind](fetch(url))
+            method = 'Source download'
+        return dict(data=data, date=date, retrieved=now(), url=url, status='Fetched', error='', method=method)
     except Exception as exc:
         snap = SNAPSHOT.get(kind)
         return dict(data=snap['data'] if snap else {}, date=snap['date'] if snap else 'Unavailable',
@@ -176,7 +244,7 @@ def country_catalog():
 def main():
     st.set_page_config(page_title='International Cost of Capital', page_icon='🌐', layout='wide')
     st.title('International Cost of Capital')
-    st.caption('FINC 470 · Compare the same project in USD and a selected country’s currency')
+    st.caption('FINC 470 · Build 1.1 · Compare the same project in USD and a selected country’s currency')
     if st.button('Refresh source data', type='primary'):
         load_source.clear()
         st.rerun()
